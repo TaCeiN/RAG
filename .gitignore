@@ -1,0 +1,94 @@
+# OS / editor local files
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local env / secrets
+.env
+.env.*
+!.env.example
+*.local
+
+# Python
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyre/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# FastAPI / RAG runtime data
+backend_fastapi/.venv/
+backend_fastapi/data/
+backend_fastapi.pid
+*.pid
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.index
+faiss.index
+faiss_meta.json
+
+# Node / React / Vite
+node_modules/
+frontend_react/node_modules/
+dist/
+frontend_react/dist/
+.vite/
+frontend_react/.vite/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Build / cache artifacts
+build/
+out/
+tmp/
+temp/
+cache/
+.cache/
+*.log
+
+# Local worktrees / agent metadata
+.worktrees/
+.superpowers/
+
+# Test-generated fixtures and scratch data
+tests/_sample.*
+tests/_state_snapshot.sql
+tests/_storage_test.sqlite3*
+tests/tmp*/
+backend_fastapi/tests/__pycache__/
+
+# User-uploaded documents and local corpus files
+*.doc
+*.docx
+*.pdf
+*.xls
+*.xlsx
+*.ppt
+*.pptx
+*.odt
+*.ods
+*.odp
+
+# Keep repository docs/specs trackable.
+!docs/**/*.md
+!backend_fastapi/README.md
+!frontend_react/README.md

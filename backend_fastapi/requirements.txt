@@ -1,0 +1,6 @@
+﻿# FastAPI backend dependencies
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+faiss-cpu>=1.8.0
+pypdf>=6.0.0
