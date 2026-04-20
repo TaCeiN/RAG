@@ -15,6 +15,10 @@ class CreateChatRequest(BaseModel):
     title: str = "New chat"
 
 
+class UpdateChatRequest(BaseModel):
+    title: str
+
+
 class SendMessageRequest(BaseModel):
     content: str
     think: bool = False
@@ -35,6 +39,13 @@ def build_router(service: RagService) -> APIRouter:
     def create_chat(payload: CreateChatRequest):
         chat_id = service.create_chat(payload.title or "New chat")
         return {"id": chat_id}
+
+    @router.patch("/chats/{chat_id}")
+    def update_chat(chat_id: str, payload: UpdateChatRequest):
+        updated = service.update_chat_title(chat_id, payload.title)
+        if not updated:
+            raise HTTPException(status_code=404, detail="Chat not found")
+        return {"id": chat_id, "title": payload.title}
 
     @router.get("/chats/{chat_id}/messages")
     def list_messages(chat_id: str):
@@ -60,6 +71,11 @@ def build_router(service: RagService) -> APIRouter:
             uploaded.append({"file_id": file_id, "filename": target.name, "status": "uploaded"})
 
         return {"files": uploaded}
+
+    @router.post("/chats/{chat_id}/files/{file_id}/cancel")
+    def cancel_file(chat_id: str, file_id: str):
+        cancelled = service.cancel_file_processing(chat_id, file_id)
+        return {"file_id": file_id, "cancelled": cancelled}
 
     @router.post("/chats/{chat_id}/messages", status_code=201)
     def stream_message(chat_id: str, payload: SendMessageRequest):

@@ -8,17 +8,17 @@ from app.domain.service import RagService, _build_context_blocks, _fit_context_t
 class PromptingTests(unittest.TestCase):
     def test_source_labels_are_human_readable(self) -> None:
         hits = [
-            {"chunk_id": "abc-uuid-1", "text": "Первый факт"},
-            {"chunk_id": "abc-uuid-2", "text": "Второй факт"},
+            {"chunk_id": "abc-uuid-1", "file_name": "a.docx", "text": "Первый факт"},
+            {"chunk_id": "abc-uuid-2", "file_name": "b.docx", "text": "Второй факт"},
         ]
 
         labeled = _with_source_labels(hits)
         context = _build_context_blocks(labeled)
 
-        self.assertEqual(labeled[0]["source_label"], "SOURCE 1")
-        self.assertEqual(labeled[1]["source_label"], "SOURCE 2")
-        self.assertIn("[SOURCE 1]", context)
-        self.assertIn("[SOURCE 2]", context)
+        self.assertEqual(labeled[0]["source_label"], "a.docx")
+        self.assertEqual(labeled[1]["source_label"], "b.docx")
+        self.assertIn("[Файл: a.docx]", context)
+        self.assertIn("[Файл: b.docx]", context)
         self.assertNotIn("abc-uuid-1", context)
 
     def test_context_includes_readable_file_metadata_when_available(self) -> None:
@@ -28,23 +28,24 @@ class PromptingTests(unittest.TestCase):
 
         context = _build_context_blocks(_with_source_labels(hits))
 
-        self.assertIn("Источник: report.docx, фрагмент 3", context)
+        self.assertIn("[Файл: report.docx]", context)
+        self.assertIn("Раздел: фрагмент 3", context)
         self.assertNotIn("abc-uuid-1", context)
 
     def test_chat_messages_enforce_russian_output_and_source_labels(self) -> None:
-        context = "[SOURCE 1]\nТекст"
+        context = "[Файл: report.docx]\nТекст"
         messages = RagService._build_chat_messages("Что в документе?", context)
 
         self.assertEqual(messages[0]["role"], "system")
         self.assertIn("Final answer language must be Russian", messages[0]["content"])
-        self.assertIn("reference only SOURCE labels", messages[0]["content"])
+        self.assertIn("reference file names", messages[0]["content"])
         self.assertIn("Do not force any fixed response template", messages[0]["content"])
         self.assertNotIn("Краткий ответ", messages[0]["content"])
         self.assertEqual(messages[1]["role"], "user")
         self.assertIn("CONTEXT_BLOCKS", messages[1]["content"])
 
     def test_report_intent_adds_whole_document_coverage_hint(self) -> None:
-        context = "[SOURCE 1]\nТекст"
+        context = "[Файл: report.docx]\nТекст"
         messages = RagService._build_chat_messages("Подготовь подробный отчет", context, intent="report")
 
         self.assertIn("whole-document coverage", messages[0]["content"])
@@ -95,7 +96,7 @@ class PromptingTests(unittest.TestCase):
 
         self.assertLessEqual(_rough_token_count(context), 35)
         self.assertEqual(len(used_hits), 1)
-        self.assertIn("[SOURCE 1]", context)
+        self.assertIn("[Файл: Файл 1]", context)
 
 
 class _FakeDbWithHistory:

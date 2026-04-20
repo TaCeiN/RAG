@@ -1,7 +1,16 @@
 ﻿import { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { createChat, fetchChats, fetchFiles, fetchMessages, streamMessage, uploadFiles } from "./lib/api";
+import {
+  cancelFileProcessing,
+  createChat,
+  fetchChats,
+  fetchFiles,
+  fetchMessages,
+  streamMessage,
+  updateChatTitle,
+  uploadFiles,
+} from "./lib/api";
 import {
   extractExtension,
   hydrateMessagesWithFiles,
@@ -38,6 +47,12 @@ function buildChatTitle(text, files) {
   return "New chat";
 }
 
+function isGenericChatTitle(title) {
+  const value = String(title || "").trim().toLowerCase();
+  if (!value) return true;
+  return value === "new chat" || /^chat\s+\d+$/.test(value);
+}
+
 function isLikelyDebugPayload(text) {
   const value = String(text || "").trim();
   if (!value.startsWith("{") || !value.endsWith("}")) return false;
@@ -46,6 +61,19 @@ function isLikelyDebugPayload(text) {
     value.includes("\"vector_candidates\"") ||
     value.includes("\"route_meta\"")
   );
+}
+
+function normalizeSummaryPoints(file) {
+  if (Array.isArray(file?.summary_key_points)) return file.summary_key_points.filter(Boolean);
+  if (typeof file?.summary_key_points_json === "string") {
+    try {
+      const parsed = JSON.parse(file.summary_key_points_json);
+      return Array.isArray(parsed) ? parsed.filter(Boolean) : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
 }
 
 function MarkdownMessage({ content }) {
@@ -86,11 +114,14 @@ export default function App() {
   const [think, setThink] = useState(false);
   const [responseMode, setResponseMode] = useState(null);
   const [isAwaitingAnswer, setIsAwaitingAnswer] = useState(false);
+  const [queuedPrompt, setQueuedPrompt] = useState(null);
   const [statusPhraseIndex, setStatusPhraseIndex] = useState(0);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sourcesOpen, setSourcesOpen] = useState(false);
+  const [selectedSource, setSelectedSource] = useState(null);
   const [isPinnedToBottom, setIsPinnedToBottom] = useState(true);
   const [copiedMessageId, setCopiedMessageId] = useState(null);
+  const [copiedSummaryId, setCopiedSummaryId] = useState(null);
   const messagesRef = useRef(null);
   const streamEndRef = useRef(null);
   const fileInputRef = useRef(null);
@@ -98,8 +129,16 @@ export default function App() {
   const skipHydrationChatIdRef = useRef(null);
   const activeChatIdRef = useRef(null);
   const chatRuntimeRef = useRef(new Map());
+  const activeStreamRef = useRef(null);
 
   const activeChat = useMemo(() => chats.find((c) => c.id === activeChatId), [chats, activeChatId]);
+  const blockingStatuses = useMemo(() => new Set(["uploaded", "indexing", "summarizing"]), []);
+  const blockingFile = useMemo(
+    () => uploadedFiles.find((file) => blockingStatuses.has(String(file?.status || "").toLowerCase())) || null,
+    [uploadedFiles, blockingStatuses]
+  );
+  const isInputLocked = Boolean(blockingFile);
+  const canInterrupt = isAwaitingAnswer || isInputLocked;
   useEffect(() => {
     activeChatIdRef.current = activeChatId;
   }, [activeChatId]);
@@ -138,6 +177,7 @@ export default function App() {
     setIsAwaitingAnswer(false);
     setInput("");
     setStatus("Ollama ready");
+    setSelectedSource(null);
     closeSidebar();
     closeSources();
   };
@@ -154,6 +194,7 @@ export default function App() {
       setIsAwaitingAnswer(false);
       setStatus("Ollama ready");
     }
+    setSelectedSource(null);
     closeSidebar();
     closeSources();
   };
@@ -234,9 +275,27 @@ export default function App() {
         setIsAwaitingAnswer(Boolean(runtime?.isAwaitingAnswer));
         setStatus(runtime?.isAwaitingAnswer ? runtime.status || "Streaming..." : "Ollama ready");
         setSourcesOpen(false);
+        setSelectedSource(null);
       })
       .catch((error) => console.error(error));
   }, [activeChatId]);
+
+  useEffect(() => {
+    if (!activeChatId) return undefined;
+    const hasPendingUploaded = uploadedFiles.some((file) =>
+      blockingStatuses.has(String(file?.status || "").toLowerCase())
+    );
+    if (!hasPendingUploaded) return undefined;
+    const timerId = window.setInterval(() => {
+      fetchFiles(activeChatId)
+        .then((files) => {
+          if (activeChatIdRef.current !== activeChatId) return;
+          setUploadedFiles(files);
+        })
+        .catch((error) => console.error(error));
+    }, 1200);
+    return () => window.clearInterval(timerId);
+  }, [activeChatId, uploadedFiles, blockingStatuses]);
 
   useEffect(() => {
     if (!isPinnedToBottom) return;
@@ -270,71 +329,64 @@ export default function App() {
     closeSidebar();
   };
 
-  const onSend = async () => {
-    const content = input.trim();
-    const hasPendingFiles = pendingFiles.length > 0;
-    if (!content && !hasPendingFiles) return;
-    const stagedFiles = hasPendingFiles ? [...pendingFiles] : [];
-    const messageAttachments = stagedFiles.map((file) => ({
-      name: file.name,
-      extension: extractExtension(file.name),
-    }));
-    let assistantMessageId = null;
-    let targetChatId = activeChatId;
+  const maybeRenameChatByFirstPrompt = async (chatId, content, files = []) => {
+    const prompt = String(content || "").trim();
+    if (!chatId || !prompt) return;
+    const currentTitle = chats.find((chat) => chat.id === chatId)?.title || "";
+    if (!isGenericChatTitle(currentTitle)) return;
+
+    const nextTitle = buildChatTitle(prompt, files);
+    if (!nextTitle || nextTitle === currentTitle) return;
 
     try {
-      if (!targetChatId) {
-        const title = buildChatTitle(content, stagedFiles);
-        const created = await createChat(title);
-        targetChatId = created.id;
-        skipHydrationChatIdRef.current = targetChatId;
-        setChats((prev) => [{ id: targetChatId, title }, ...prev]);
-        setActiveChatId(targetChatId);
-        setMessages([]);
-        setUploadedFiles([]);
-        setResponseMode(null);
-        setSourcesOpen(false);
-      }
+      await updateChatTitle(chatId, nextTitle);
+      setChats((prev) => prev.map((chat) => (chat.id === chatId ? { ...chat, title: nextTitle } : chat)));
+    } catch (error) {
+      console.error(error);
+    }
+  };
 
-      if (hasPendingFiles) {
-        setStatus("Uploading and indexing...");
-        await uploadFiles(targetChatId, stagedFiles);
-        const files = await fetchFiles(targetChatId);
-        setUploadedFiles(files);
-        setPendingFiles([]);
-        if (fileInputRef.current) fileInputRef.current.value = "";
-        setStatus("Files uploaded");
-      }
+  const appendUserMessageToChat = (targetChatId, content, attachments = []) => {
+    const userMessage = makeMessage("user", content, attachments);
+    const baseMessages =
+      chatRuntimeRef.current.get(targetChatId)?.messages ||
+      (activeChatIdRef.current === targetChatId ? messages : []);
+    const nextMessages = [...baseMessages, userMessage];
+    updateChatRuntime(targetChatId, (runtime) => ({
+      ...runtime,
+      messages: nextMessages,
+    }));
+    setMessages(nextMessages);
+    setIsPinnedToBottom(true);
+  };
 
-      if (!content) {
-        if (messageAttachments.length > 0) {
-          setMessages((prev) => [...prev, makeMessage("user", "", messageAttachments)]);
-          setIsPinnedToBottom(true);
-        }
-        return;
-      }
+  const sendQuestionNow = async (targetChatId, content, messageAttachments, options = {}) => {
+    const appendUserMessage = options.appendUserMessage !== false;
+    const assistantMessage = makeMessage("assistant", "", [], { renderMode: debug ? "plain" : "markdown" });
+    const assistantMessageId = assistantMessage.id;
+    if (appendUserMessage) {
+      appendUserMessageToChat(targetChatId, content, messageAttachments);
+    }
+    const baseMessages =
+      chatRuntimeRef.current.get(targetChatId)?.messages ||
+      (activeChatIdRef.current === targetChatId ? messages : []);
+    const nextMessages = [...baseMessages, assistantMessage];
 
-      const userMessage = makeMessage("user", content, messageAttachments);
-      const assistantMessage = makeMessage("assistant", "", [], { renderMode: debug ? "plain" : "markdown" });
-      assistantMessageId = assistantMessage.id;
-      const baseMessages =
-        chatRuntimeRef.current.get(targetChatId)?.messages ||
-        (activeChatIdRef.current === targetChatId ? messages : []);
-      const nextMessages = [...baseMessages, userMessage, assistantMessage];
+    updateChatRuntime(targetChatId, (runtime) => ({
+      ...runtime,
+      messages: nextMessages,
+      status: "Streaming...",
+      isAwaitingAnswer: true,
+      responseMode: null,
+    }));
+    setMessages(nextMessages);
+    setIsPinnedToBottom(true);
+    setIsAwaitingAnswer(true);
+    setStatus("Streaming...");
 
-      setInput("");
-      updateChatRuntime(targetChatId, (runtime) => ({
-        ...runtime,
-        messages: nextMessages,
-        status: "Streaming...",
-        isAwaitingAnswer: true,
-        responseMode: null,
-      }));
-      setMessages(nextMessages);
-      setIsPinnedToBottom(true);
-      setIsAwaitingAnswer(true);
-      setStatus("Streaming...");
-
+    try {
+      const controller = new AbortController();
+      activeStreamRef.current = { chatId: targetChatId, assistantMessageId, controller };
       await streamMessage(
         targetChatId,
         {
@@ -342,7 +394,7 @@ export default function App() {
           think,
           debug_retrieval: debug,
           retrieval_mode: "hybrid_plus",
-          force_rag_on_upload: hasPendingFiles,
+          force_rag_on_upload: false,
         },
         (event) => {
           const mode = event?.trace?.route_meta?.response_mode;
@@ -369,6 +421,17 @@ export default function App() {
             updateChatRuntime(targetChatId, (runtime) => ({
               ...runtime,
               status: "Generating answer...",
+              isAwaitingAnswer: true,
+            }));
+            return;
+          }
+          if (event.type === "retrieval_confidence") {
+            const files = Array.isArray(event.files) && event.files.length ? event.files.join(", ") : "без файла";
+            const confidence = String(event.level || "unknown");
+            const sources = Number(event.sources_count || 0);
+            updateChatRuntime(targetChatId, (runtime) => ({
+              ...runtime,
+              status: `Файл: ${files} · найдено ${sources} фрагм. · уверенность ${confidence}`,
               isAwaitingAnswer: true,
             }));
             return;
@@ -415,23 +478,129 @@ export default function App() {
               status: "Ollama ready",
             }));
             chatRuntimeRef.current.delete(targetChatId);
+            if (activeStreamRef.current?.assistantMessageId === assistantMessageId) {
+              activeStreamRef.current = null;
+            }
           }
+        }
+        ,
+        {
+          signal: controller.signal,
         }
       );
     } catch (error) {
-      console.error(error);
-      const errorText = String(error?.message || "Request failed");
-      if (assistantMessageId && targetChatId) {
+      if (activeStreamRef.current?.assistantMessageId === assistantMessageId) {
+        activeStreamRef.current = null;
+      }
+      if (error?.name === "AbortError") {
+        const interruptedText = "Генерация была прервана пользователем.";
         updateChatRuntime(targetChatId, (runtime) => ({
           ...runtime,
           messages: updateAssistantMessage(runtime.messages || [], assistantMessageId, (message) => ({
             ...message,
-            content: errorText,
+            content: interruptedText,
           })),
           isAwaitingAnswer: false,
-          status: errorText,
+          status: "Остановлено",
         }));
-      } else if (activeChatId) {
+        chatRuntimeRef.current.delete(targetChatId);
+        if (activeChatIdRef.current === targetChatId) {
+          setIsAwaitingAnswer(false);
+          setStatus("Остановлено");
+        }
+        return;
+      }
+      console.error(error);
+      const errorText = String(error?.message || "Request failed");
+      updateChatRuntime(targetChatId, (runtime) => ({
+        ...runtime,
+        messages: updateAssistantMessage(runtime.messages || [], assistantMessageId, (message) => ({
+          ...message,
+          content: errorText,
+        })),
+        isAwaitingAnswer: false,
+        status: errorText,
+      }));
+      if (activeChatIdRef.current === targetChatId) {
+        setIsAwaitingAnswer(false);
+        setStatus(errorText);
+      }
+    }
+  };
+
+  const onSend = async () => {
+    const content = input.trim();
+    if (isInputLocked) {
+      if (content && activeChatId) {
+        await maybeRenameChatByFirstPrompt(activeChatId, content, []);
+        appendUserMessageToChat(activeChatId, content, []);
+        setQueuedPrompt({ chatId: activeChatId, content });
+        setInput("");
+        setStatus("Вопрос сохранен. Отправлю его автоматически после готовности summary.");
+      } else {
+        setStatus("Файл загружен. Сначала формируется краткое содержание, после этого можно задавать вопросы.");
+      }
+      return;
+    }
+    const hasPendingFiles = pendingFiles.length > 0;
+    if (!content && !hasPendingFiles) return;
+    const stagedFiles = hasPendingFiles ? [...pendingFiles] : [];
+    const messageAttachments = stagedFiles.map((file) => ({
+      name: file.name,
+      extension: extractExtension(file.name),
+    }));
+    let targetChatId = activeChatId;
+
+    try {
+      if (!targetChatId) {
+        const title = buildChatTitle(content, stagedFiles);
+        const created = await createChat(title);
+        targetChatId = created.id;
+        skipHydrationChatIdRef.current = targetChatId;
+        setChats((prev) => [{ id: targetChatId, title }, ...prev]);
+        setActiveChatId(targetChatId);
+        setMessages([]);
+        setUploadedFiles([]);
+        setResponseMode(null);
+        setSourcesOpen(false);
+      }
+
+      if (hasPendingFiles) {
+        setStatus("Uploading and indexing...");
+        await uploadFiles(targetChatId, stagedFiles);
+        const files = await fetchFiles(targetChatId);
+        setUploadedFiles(files);
+        setPendingFiles([]);
+        if (fileInputRef.current) fileInputRef.current.value = "";
+        setStatus("Files uploaded");
+        const hasBlockingAfterUpload = files.some((file) =>
+          blockingStatuses.has(String(file?.status || "").toLowerCase())
+        );
+        if (content && hasBlockingAfterUpload) {
+          await maybeRenameChatByFirstPrompt(targetChatId, content, stagedFiles);
+          appendUserMessageToChat(targetChatId, content, messageAttachments);
+          setInput("");
+          setQueuedPrompt({ chatId: targetChatId, content });
+          setStatus("Файл обрабатывается. Вопрос сохранен и будет отправлен автоматически.");
+          return;
+        }
+      }
+
+      if (!content) {
+        if (messageAttachments.length > 0) {
+          setMessages((prev) => [...prev, makeMessage("user", "", messageAttachments)]);
+          setIsPinnedToBottom(true);
+        }
+        return;
+      }
+
+      await maybeRenameChatByFirstPrompt(targetChatId, content, stagedFiles);
+      setInput("");
+      await sendQuestionNow(targetChatId, content, messageAttachments, { appendUserMessage: true });
+    } catch (error) {
+      console.error(error);
+      const errorText = String(error?.message || "Request failed");
+      if (activeChatId) {
         setMessages((prev) => [...prev, makeMessage("assistant", errorText)]);
       }
       if (!targetChatId || activeChatIdRef.current === targetChatId) {
@@ -442,6 +611,7 @@ export default function App() {
   };
 
   const onUpload = async (event) => {
+    if (isInputLocked) return;
     const files = Array.from(event.target.files || []);
     if (!files.length) return;
     setPendingFiles((prev) => {
@@ -476,12 +646,80 @@ export default function App() {
     }
   };
 
+  useEffect(() => {
+    if (!queuedPrompt) return;
+    if (isAwaitingAnswer) return;
+    if (activeChatIdRef.current !== queuedPrompt.chatId) return;
+    const hasPendingUploaded = uploadedFiles.some((file) =>
+      blockingStatuses.has(String(file?.status || "").toLowerCase())
+    );
+    if (hasPendingUploaded) return;
+    const queuedContent = String(queuedPrompt.content || "").trim();
+    if (!queuedContent) {
+      setQueuedPrompt(null);
+      return;
+    }
+    setQueuedPrompt(null);
+    setStatus("Summary готово. Отправляю сохраненный вопрос...");
+    sendQuestionNow(queuedPrompt.chatId, queuedContent, [], { appendUserMessage: false }).catch((error) => {
+      console.error(error);
+      setStatus("Не удалось отправить сохраненный вопрос");
+    });
+  }, [queuedPrompt, isAwaitingAnswer, uploadedFiles, blockingStatuses]);
+
+  const onCopySummary = async (file) => {
+    const fileId = resolveFileId(file);
+    const summary = String(file?.summary || "").trim();
+    if (!summary) return;
+    try {
+      await navigator.clipboard.writeText(summary);
+      setCopiedSummaryId(fileId);
+      window.setTimeout(() => {
+        setCopiedSummaryId((current) => (current === fileId ? null : current));
+      }, 1500);
+    } catch (error) {
+      console.error(error);
+      setStatus("Не удалось скопировать summary");
+    }
+  };
+
   const onComposerKeyDown = (event) => {
     if (event.key !== "Enter") return;
     if (event.shiftKey) return;
     if (event.nativeEvent?.isComposing) return;
     event.preventDefault();
     onSend();
+  };
+
+  const onStopStream = () => {
+    const active = activeStreamRef.current;
+    if (active?.controller) {
+      active.controller.abort();
+      return;
+    }
+    if (!activeChatId || !isInputLocked) return;
+    const pendingUploads = uploadedFiles.filter((file) =>
+      blockingStatuses.has(String(file?.status || "").toLowerCase())
+    );
+    Promise.all(
+      pendingUploads
+        .map((file) => resolveFileId(file))
+        .filter(Boolean)
+        .map((fileId) => cancelFileProcessing(activeChatId, fileId))
+    )
+      .then(async () => {
+        setQueuedPrompt(null);
+        setPendingFiles([]);
+        if (fileInputRef.current) fileInputRef.current.value = "";
+        const files = await fetchFiles(activeChatId);
+        setUploadedFiles(files);
+        setMessages((prev) => [...prev, makeMessage("assistant", "Обработка файла была прервана пользователем.")]);
+        setStatus("Остановлено");
+      })
+      .catch((error) => {
+        console.error(error);
+        setStatus("Не удалось прервать обработку файла");
+      });
   };
 
   return (
@@ -609,6 +847,12 @@ export default function App() {
                   <span>{statusNarrative}</span>
                 </div>
               )}
+              {activeChat && !isAwaitingAnswer && isInputLocked && (
+                <div className="statusNarrative" role="status" aria-live="polite">
+                  <span className="statusSpinner" aria-hidden="true" />
+                  <span>Файл загружен. Сначала формируется краткое содержание, после этого можно задавать вопросы.</span>
+                </div>
+              )}
               <div ref={streamEndRef} />
             </div>
 
@@ -640,6 +884,7 @@ export default function App() {
                     value={input}
                     onChange={(e) => setInput(e.target.value)}
                     onKeyDown={onComposerKeyDown}
+                    disabled={isInputLocked}
                     placeholder="Ask about uploaded files..."
                   />
                 </div>
@@ -676,7 +921,7 @@ export default function App() {
                       </svg>
                     </button>
 
-                    <label className="iconToggle uploadToggle" title="Upload files">
+                    <label className={isInputLocked ? "iconToggle uploadToggle isDisabled" : "iconToggle uploadToggle"} title="Upload files">
                       <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" aria-hidden="true">
                         <path
                           fill="none"
@@ -687,28 +932,47 @@ export default function App() {
                           d="m18.375 12.739l-7.693 7.693a4.5 4.5 0 0 1-6.364-6.364l10.94-10.94A3 3 0 1 1 19.5 7.372L8.552 18.32m.009-.01l-.01.01m5.699-9.941l-7.81 7.81a1.5 1.5 0 0 0 2.112 2.13"
                         />
                       </svg>
-                      <input ref={fileInputRef} type="file" multiple onChange={onUpload} hidden />
+                      <input ref={fileInputRef} type="file" multiple onChange={onUpload} hidden disabled={isInputLocked} />
                     </label>
                   </div>
 
-                  <button className="sendBtn" onClick={onSend} aria-label="Send">
-                    <svg
-                      width="18"
-                      height="18"
-                      viewBox="0 0 24 24"
-                      xmlns="http://www.w3.org/2000/svg"
-                      role="img"
-                      aria-hidden="true"
-                    >
-                      <path
-                        d="M12 17V7m0 0l-4 4m4-4l4 4"
-                        fill="none"
-                        stroke="currentColor"
-                        strokeWidth="2"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                      />
-                    </svg>
+                  <button
+                    className="sendBtn"
+                    onClick={canInterrupt ? onStopStream : onSend}
+                    aria-label={canInterrupt ? "Stop generation" : "Send"}
+                    disabled={false}
+                    title={canInterrupt ? "Остановить ответ" : "Отправить"}
+                  >
+                    {canInterrupt ? (
+                      <svg
+                        width="18"
+                        height="18"
+                        viewBox="0 0 24 24"
+                        xmlns="http://www.w3.org/2000/svg"
+                        role="img"
+                        aria-hidden="true"
+                      >
+                        <rect x="7" y="7" width="10" height="10" fill="currentColor" rx="1.5" />
+                      </svg>
+                    ) : (
+                      <svg
+                        width="18"
+                        height="18"
+                        viewBox="0 0 24 24"
+                        xmlns="http://www.w3.org/2000/svg"
+                        role="img"
+                        aria-hidden="true"
+                      >
+                        <path
+                          d="M12 17V7m0 0l-4 4m4-4l4 4"
+                          fill="none"
+                          stroke="currentColor"
+                          strokeWidth="2"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                        />
+                      </svg>
+                    )}
                   </button>
                 </div>
               </div>
@@ -723,15 +987,52 @@ export default function App() {
                 {uploadedFiles.map((file, index) => {
                   const fileName = resolveFileName(file);
                   const extension = extractExtension(fileName);
+                  const statusValue = String(file?.status || "").toLowerCase();
                   return (
-                    <article key={resolveFileId(file, index)} className="sourceCard">
+                    <button
+                      type="button"
+                      key={resolveFileId(file, index)}
+                      className="sourceCard"
+                      onClick={() => setSelectedSource(file)}
+                    >
                       <p>{fileName}</p>
                       <span>{extension}</span>
-                    </article>
+                      <small className="statusText">Статус: {statusValue || "unknown"}</small>
+                    </button>
                   );
                 })}
               </div>
             </aside>
+          )}
+          {selectedSource && (
+            <div className="summaryModalBackdrop" role="presentation" onClick={() => setSelectedSource(null)}>
+              <section className="summaryModal" role="dialog" aria-modal="true" onClick={(event) => event.stopPropagation()}>
+                <header className="summaryModalHeader">
+                  <h3>{resolveFileName(selectedSource)}</h3>
+                  <button type="button" onClick={() => setSelectedSource(null)} aria-label="Close summary">
+                    x
+                  </button>
+                </header>
+                <p className="statusText">Статус: {String(selectedSource?.status || "unknown")}</p>
+                {String(selectedSource?.summary || "").trim() ? (
+                  <>
+                    <pre className="summaryText">{String(selectedSource.summary).trim()}</pre>
+                    {normalizeSummaryPoints(selectedSource).length > 0 && (
+                      <ul className="summaryList">
+                        {normalizeSummaryPoints(selectedSource).map((point, index) => (
+                          <li key={`${resolveFileId(selectedSource)}-${index}`}>{point}</li>
+                        ))}
+                      </ul>
+                    )}
+                    <button type="button" className="messageActionBtn" onClick={() => onCopySummary(selectedSource)}>
+                      {copiedSummaryId === resolveFileId(selectedSource) ? "Скопировано" : "Копировать summary"}
+                    </button>
+                  </>
+                ) : (
+                  <p className="statusText">Summary формируется. До готовности файла вопросы заблокированы.</p>
+                )}
+              </section>
+            </div>
           )}
         </div>
       </main>

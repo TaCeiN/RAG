@@ -441,6 +441,8 @@ textarea:focus-visible,
 .sourceCard {
   display: grid;
   gap: 10px;
+  width: 100%;
+  text-align: left;
   padding: 12px;
   border: 1px solid #3a3732;
   border-radius: 12px;
@@ -466,6 +468,10 @@ textarea:focus-visible,
   font-size: 0.82rem;
   font-weight: 600;
   letter-spacing: 0.02em;
+}
+
+.sourceCard .statusText {
+  margin: 0;
 }
 
 .statusText {
@@ -822,6 +828,11 @@ pre {
   cursor: pointer;
 }
 
+.uploadToggle.isDisabled {
+  pointer-events: none;
+  opacity: 0.55;
+}
+
 .composerMain {
   display: block;
 }
@@ -841,6 +852,11 @@ textarea {
 
 textarea::placeholder {
   color: #8d8276;
+}
+
+textarea:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
 }
 
 .sendBtn {
@@ -863,6 +879,62 @@ textarea::placeholder {
   border-color: #cf6f50;
   color: #fffaf5;
   background: #cf6f50;
+}
+
+.sendBtn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.summaryModalBackdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: grid;
+  place-items: center;
+  background: rgba(8, 8, 8, 0.65);
+}
+
+.summaryModal {
+  width: min(760px, 92vw);
+  max-height: min(82vh, 880px);
+  overflow: auto;
+  padding: 16px;
+  border: 1px solid #3f3a35;
+  border-radius: 12px;
+  background: #22211f;
+}
+
+.summaryModalHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.summaryModalHeader h3 {
+  margin: 0;
+  font-size: 1.04rem;
+}
+
+.summaryModalHeader button {
+  width: 28px;
+  height: 28px;
+  min-height: 28px;
+  padding: 0;
+  border: 1px solid #4b463f;
+  border-radius: 8px;
+}
+
+.summaryText {
+  margin: 12px 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.summaryList {
+  margin: 0 0 12px 18px;
+  padding: 0;
 }
 
 .starterChips {

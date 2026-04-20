@@ -58,6 +58,7 @@ class RagService:
         self.reranker = reranker
         self._router_vectors: dict[str, list[float]] = {}
         self._router_vectors_initialized = False
+        self._cancel_events: dict[str, threading.Event] = {}
         self._bootstrap_vector_store_from_db()
 
     def _init_router_vectors(self) -> dict[str, list[float]]:
@@ -119,6 +120,7 @@ class RagService:
                         "file_id": chunk.get("file_id"),
                         "file_name": chunk.get("file_name"),
                         "chunk_index": chunk.get("chunk_index"),
+                        "source_uid": chunk.get("source_uid"),
                         "text": chunk["text"],
                         "vector": vector,
                     }
@@ -133,28 +135,84 @@ class RagService:
     def list_chats(self) -> list[dict[str, object]]:
         return self.db.list_chats()
 
+    def update_chat_title(self, chat_id: str, title: str) -> bool:
+        clean = str(title or "").strip()
+        if not clean:
+            return False
+        return self.db.update_chat_title(chat_id, clean)
+
     def list_messages(self, chat_id: str) -> list[dict[str, object]]:
         return self.db.list_messages(chat_id)
 
     def list_files(self, chat_id: str) -> list[dict[str, object]]:
-        return self.db.list_files(chat_id)
+        rows = self.db.list_files(chat_id)
+        normalized: list[dict[str, object]] = []
+        for row in rows:
+            cloned = dict(row)
+            raw_points = cloned.get("summary_key_points_json") or "[]"
+            try:
+                points = json.loads(str(raw_points))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                points = []
+            cloned["summary_key_points"] = [str(item).strip() for item in points if str(item).strip()]
+            normalized.append(cloned)
+        return normalized
 
     def queue_ingest_path(self, chat_id: str, file_path: Path) -> str:
         file_id = self.db.store_file(chat_id, file_path.name, "", status="uploaded")
+        self._cancel_events[file_id] = threading.Event()
         worker = threading.Thread(target=self._index_file_worker, args=(chat_id, file_id, file_path), daemon=True)
         worker.start()
         return file_id
 
     def _index_file_worker(self, chat_id: str, file_id: str, file_path: Path) -> None:
         try:
+            if self._is_file_canceled(file_id):
+                self.db.update_file_status(file_id, "canceled")
+                return
             self.db.update_file_status(file_id, "indexing")
             text = extract_text(file_path)
+            if self._is_file_canceled(file_id):
+                self.db.update_file_status(file_id, "canceled")
+                return
             self.db.update_file_text(file_id, text)
             self._index_text(chat_id, file_id, text)
+            if self._is_file_canceled(file_id):
+                self.db.update_file_status(file_id, "canceled")
+                return
+            self.db.update_file_status(file_id, "summarizing")
+            summary, key_points = self._build_file_summary(text, file_name=file_path.name)
+            if self._is_file_canceled(file_id):
+                self.db.update_file_status(file_id, "canceled")
+                return
+            self.db.update_file_summary(file_id, summary=summary, key_points_json=json.dumps(key_points, ensure_ascii=False))
             self.db.update_file_status(file_id, "ready")
         except Exception as exc:  # noqa: BLE001
+            self.db.update_file_summary(file_id, summary="", key_points_json="[]", summary_error=str(exc))
             self.db.update_file_status(file_id, "error")
             log(f"Indexing failed for {file_path.name}: {exc}")
+        finally:
+            self._cancel_events.pop(file_id, None)
+
+    def _is_file_canceled(self, file_id: str) -> bool:
+        event = self._cancel_events.get(file_id)
+        return bool(event and event.is_set())
+
+    def cancel_file_processing(self, chat_id: str, file_id: str) -> bool:
+        rows = self.db.list_files(chat_id)
+        row = next((item for item in rows if str(item.get("id", "")) == file_id), None)
+        if row is None:
+            return False
+        status = str(row.get("status", "")).strip().lower()
+        if status in {"ready", "error", "canceled"}:
+            return False
+        event = self._cancel_events.get(file_id)
+        if event is None:
+            event = threading.Event()
+            self._cancel_events[file_id] = event
+        event.set()
+        self.db.update_file_status(file_id, "canceled")
+        return True
 
     def _index_text(self, chat_id: str, file_id: str, text: str) -> None:
         chunks = chunk_text(text)
@@ -165,14 +223,52 @@ class RagService:
                 file_name = str(row.get("name", ""))
                 break
         for index, (chunk, vector) in enumerate(zip(chunks, vectors, strict=True)):
-            chunk_id = self.db.store_chunk(chat_id, file_id, index, chunk, json.dumps(vector))
+            source_uid = f"{file_id}:{_section_id(chunk, index)}"
+            chunk_id = self.db.store_chunk(chat_id, file_id, index, chunk, json.dumps(vector), source_uid=source_uid)
             self.vector_store.add(
                 chat_id,
                 chunk_id,
                 chunk,
                 vector,
-                metadata={"file_id": file_id, "file_name": file_name, "chunk_index": index},
+                metadata={"file_id": file_id, "file_name": file_name, "chunk_index": index, "source_uid": source_uid},
             )
+
+    def _build_file_summary(self, text: str, file_name: str) -> tuple[str, list[str]]:
+        compact = _truncate_to_token_budget(text.strip(), max_tokens=1800)
+        if not compact:
+            return ("", [])
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Ты аналитик документа. Верни только JSON формата "
+                    '{"summary":"...","key_points":["..."]}. '
+                    "summary: 4-7 предложений на русском, key_points: 5-8 коротких пунктов."
+                ),
+            },
+            {"role": "user", "content": f"Файл: {file_name}\n\nТекст:\n{compact}"},
+        ]
+        raw = self._collect_generation(messages, think=False)
+        parsed = _extract_json_object(raw)
+        summary = str(parsed.get("summary", "")).strip()
+        points_raw = parsed.get("key_points", [])
+        key_points = [str(item).strip() for item in points_raw if str(item).strip()] if isinstance(points_raw, list) else []
+        if not summary:
+            summary = _fallback_summary_from_text(compact)
+        if not key_points:
+            key_points = _fallback_key_points_from_text(compact, limit=6)
+        return summary, key_points[:8]
+
+    def _collect_generation(self, messages: list[dict[str, str]], think: bool) -> str:
+        parts: list[str] = []
+        for chunk in self.generator.stream_chat(messages, think=think, keep_alive=settings.generator_keep_alive):
+            message = chunk.get("message") or {}
+            content = message.get("content")
+            if content:
+                parts.append(str(content))
+            if chunk.get("done"):
+                break
+        return "".join(parts).strip()
 
     def stream_answer(
         self,
@@ -184,38 +280,55 @@ class RagService:
         top_k: int,
         force_rag_on_upload: bool = False,
     ):
-        normalized_question = _normalize_query_text(question)
-        retrieval_question, followup_meta = self._resolve_retrieval_question(chat_id, question, normalized_question)
+        files_rows = self.db.list_files(chat_id)
+        mentioned_file_ids, mentioned_file_names, question_without_mentions = _resolve_mentioned_files(question, files_rows)
+        effective_question = question_without_mentions or question
+        normalized_question = _normalize_query_text(effective_question)
+        document_scoped_query = bool(mentioned_file_ids) or _is_document_scoped_query(normalized_question)
+        llm_route = self._route_with_llm(chat_id, effective_question, normalized_question)
+        retrieval_question, followup_meta = self._resolve_retrieval_question(
+            chat_id,
+            effective_question,
+            normalized_question,
+        )
+        if (
+            llm_route.get("router_used")
+            and llm_route.get("needs_previous_message")
+            and str(llm_route.get("rewritten_question", "")).strip()
+        ):
+            retrieval_question = str(llm_route.get("rewritten_question", "")).strip()
+            followup_meta = {
+                **followup_meta,
+                "is_followup": True,
+                "reason": "llm_router_rewrite",
+                "effective_query": retrieval_question,
+            }
         mode = _resolve_retrieval_mode(retrieval_mode)
         yield {
             "type": "status",
             "message": "Модель сейчас анализирует ваш запрос (роутер определяет тип задачи и стратегию поиска).",
         }
-        index_wait_meta = self._wait_for_indexed_chunks(chat_id)
+        index_wait_meta = self._wait_for_indexed_chunks(chat_id, require_ready=force_rag_on_upload)
         if index_wait_meta.get("waited"):
             yield {
                 "type": "status",
                 "message": "Модель сейчас подготавливает документ (ожидание завершения индексации файла).",
             }
 
-        if (
-            int(index_wait_meta.get("files_total", 0)) > 0
-            and int(index_wait_meta.get("chunk_count", 0)) == 0
-            and int(index_wait_meta.get("pending_files", 0)) > 0
-        ):
+        if int(index_wait_meta.get("pending_files", 0)) > 0:
             self.db.store_message(chat_id, "user", question)
             answer = (
-                "Файл загружен, но его индексация ещё не завершилась. "
-                "Попробуйте повторить запрос через несколько секунд."
+                "Файл еще формирует краткое содержание слишком долго, поэтому ответ сейчас не готов. "
+                "Попробуйте повторить этот же вопрос через 10-20 секунд."
             )
             trace = {
                 "retrieval_mode": mode,
                 "original_query": question,
                 "normalized_query": normalized_question,
-                "total_chunks_in_chat": 0,
+                "total_chunks_in_chat": int(index_wait_meta.get("chunk_count", 0)),
                 "route_meta": {
                     "response_mode": "indexing_wait",
-                    "response_reason": "indexing_in_progress",
+                    "response_reason": "file_summary_in_progress",
                     "index_wait_meta": index_wait_meta,
                 },
             }
@@ -230,8 +343,67 @@ class RagService:
                 "trace": trace,
             }
             return
+        if document_scoped_query and _is_summary_request(normalized_question):
+            summary_scope = set(mentioned_file_ids)
+            ready_with_summary = [
+                row
+                for row in files_rows
+                if (not summary_scope or str(row.get("id", "")) in summary_scope)
+                if str(row.get("status", "")).strip().lower() == "ready" and str(row.get("summary", "")).strip()
+            ]
+            if ready_with_summary:
+                latest = ready_with_summary[-1]
+                file_name = str(latest.get("name", "")).strip() or "файл"
+                summary_text = str(latest.get("summary", "")).strip()
+                points_raw = str(latest.get("summary_key_points_json", "[]") or "[]")
+                try:
+                    points = json.loads(points_raw)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    points = []
+                bullets = [
+                    f"- {str(item).strip()}"
+                    for item in points
+                    if str(item).strip()
+                ][:6]
+                answer = f"Краткое содержание файла «{file_name}»:\n\n{summary_text}"
+                if bullets:
+                    answer += "\n\nКлючевые пункты:\n" + "\n".join(bullets)
+                trace = {
+                    "retrieval_mode": mode,
+                    "original_query": question,
+                    "normalized_query": normalized_question,
+                    "total_chunks_in_chat": int(index_wait_meta.get("chunk_count", 0)),
+                    "route_meta": {
+                        "response_mode": "file_summary",
+                        "response_reason": "precomputed_summary_reply",
+                        "file_name": file_name,
+                    },
+                    "mention_meta": {
+                        "mentioned_file_ids": mentioned_file_ids,
+                        "mentioned_file_names": mentioned_file_names,
+                    },
+                }
+                self.db.store_message(chat_id, "user", question)
+                self.db.store_message(chat_id, "assistant", answer)
+                yield {"type": "answer", "delta": answer}
+                yield {
+                    "type": "done",
+                    "answer": answer,
+                    "thinking": "",
+                    "context": "(file_summary)",
+                    "sources": [],
+                    "trace": trace,
+                }
+                return
 
-        retrieval = self._retrieve(chat_id, question, retrieval_question, mode, top_k)
+        retrieval = self._retrieve(
+            chat_id,
+            question,
+            retrieval_question,
+            mode,
+            top_k,
+            mentioned_file_ids=set(mentioned_file_ids),
+        )
         hits = retrieval["final"]
         labeled_hits = _with_source_labels(hits)
         trace = retrieval["trace"]
@@ -267,8 +439,46 @@ class RagService:
             else:
                 response_mode = "rag"
                 response_reason = "forced_rag_uploaded_with_message"
+        has_uploaded_files = int(index_wait_meta.get("files_total", 0)) > 0
+        is_conversational = _is_conversational_query(question)
+        explicit_no_rag = _prefers_direct_without_docs(question)
+        if has_uploaded_files:
+            if explicit_no_rag:
+                response_mode = "direct_chat"
+                response_reason = "explicit_direct_without_docs"
+            elif document_scoped_query or not is_conversational:
+                response_mode = "rag"
+                response_reason = "files_present_default_rag"
+            else:
+                response_mode = "direct_chat"
+                response_reason = "conversational_with_files"
+        llm_mode = str(llm_route.get("mode", "")).strip().lower()
+        llm_confidence = str(llm_route.get("confidence", "medium")).strip().lower()
+        if llm_mode in {"rag", "followup_rag"}:
+            response_mode = "rag"
+            response_reason = "llm_router_rag"
+        elif (
+            llm_mode in {"direct", "followup_direct"}
+            and not has_uploaded_files
+            and llm_confidence in {"high", "medium"}
+        ):
+            response_mode = "direct_chat"
+            response_reason = "llm_router_direct_no_files"
+        elif (
+            llm_mode in {"direct", "followup_direct"}
+            and has_uploaded_files
+            and explicit_no_rag
+            and llm_confidence == "high"
+        ):
+            response_mode = "direct_chat"
+            response_reason = "llm_router_direct_explicit_no_rag"
         route_meta["response_mode"] = response_mode
         route_meta["response_reason"] = response_reason
+        route_meta["llm_route"] = llm_route
+        route_meta["mention_meta"] = {
+            "mentioned_file_ids": mentioned_file_ids,
+            "mentioned_file_names": mentioned_file_names,
+        }
         effective_min_hits = _effective_min_hits(trace)
         route_meta["direct_chat_thresholds"] = {
             "min_hits": settings.direct_chat_min_hits,
@@ -299,6 +509,14 @@ class RagService:
             return
 
         if response_mode == "rag":
+            confidence_level = _confidence_level(off_topic_meta, hits)
+            yield {
+                "type": "retrieval_confidence",
+                "level": confidence_level,
+                "files": sorted({str(hit.get("file_name", "")).strip() for hit in labeled_hits if str(hit.get("file_name", "")).strip()}),
+                "sources_count": len(labeled_hits),
+                "reason": response_reason,
+            }
             yield {"type": "search_started"}
             selected_mode = str(route_meta.get("selected_retrieval_mode", "hybrid"))
             yield {
@@ -341,6 +559,33 @@ class RagService:
             }
             return
         else:
+            if (
+                has_uploaded_files
+                and not _is_conversational_query(question)
+                and not _prefers_direct_without_docs(question)
+            ):
+                if mentioned_file_names:
+                    names = ", ".join(mentioned_file_names)
+                    answer = (
+                        f"Я не нашёл релевантный фрагмент в отмеченном файле ({names}). "
+                        "Уточните запрос или попробуйте вопрос к другому файлу."
+                    )
+                else:
+                    answer = (
+                        "Я не нашёл достаточно релевантный фрагмент в загруженных документах. "
+                        "Переформулируйте вопрос или разрешите ответить общими знаниями."
+                    )
+                self.db.store_message(chat_id, "assistant", answer)
+                yield {"type": "answer", "delta": answer}
+                yield {
+                    "type": "done",
+                    "answer": answer,
+                    "thinking": "",
+                    "context": "(direct_chat_blocked)",
+                    "sources": [],
+                    "trace": trace,
+                }
+                return
             yield {
                 "type": "status",
                 "message": "Модель сейчас отвечает в дружеском разговорном режиме (без поиска по документам).",
@@ -497,7 +742,7 @@ class RagService:
                     "3) Keep wording natural, clear, friendly, and practical.\n"
                     "4) If context is insufficient, explicitly say what is missing.\n"
                     "5) Do not expose internal IDs or chunk UUIDs.\n"
-                    "6) When citing evidence, reference only SOURCE labels from the context (e.g., SOURCE 1).\n"
+                    "6) When citing evidence, always reference file names from CONTEXT_BLOCKS.\n"
                     "7) Do not force any fixed response template unless the user explicitly asks for one.\n"
                     "8) Choose structure and depth based on user intent and question complexity.\n"
                     "9) Never infer, guess, or complete missing facts from general knowledge.\n"
@@ -545,7 +790,7 @@ class RagService:
         messages.append({"role": "user", "content": question})
         return messages
 
-    def _wait_for_indexed_chunks(self, chat_id: str) -> dict[str, object]:
+    def _wait_for_indexed_chunks(self, chat_id: str, require_ready: bool = False) -> dict[str, object]:
         timeout_seconds = max(0.0, float(settings.rag_index_wait_timeout_seconds))
         poll_seconds = max(0.05, float(settings.rag_index_wait_poll_seconds))
         waited = False
@@ -556,7 +801,7 @@ class RagService:
             state["waited"] = False
             state["wait_seconds"] = 0.0
             return state
-        if state["chunk_count"] > 0:
+        if (not require_ready) and state["chunk_count"] > 0:
             state["waited"] = False
             state["wait_seconds"] = 0.0
             return state
@@ -577,11 +822,22 @@ class RagService:
 
         state["waited"] = waited
         state["wait_seconds"] = round(max(0.0, time.monotonic() - start), 3)
+        if require_ready and state["pending_files"] <= 0:
+            return state
+        if require_ready and state["pending_files"] > 0:
+            while time.monotonic() < deadline:
+                waited = True
+                time.sleep(poll_seconds)
+                state = self._chat_index_state(chat_id)
+                if state["pending_files"] <= 0:
+                    break
+            state["waited"] = waited
+            state["wait_seconds"] = round(max(0.0, time.monotonic() - start), 3)
         return state
 
     def _chat_index_state(self, chat_id: str) -> dict[str, object]:
         files = self.db.list_files(chat_id)
-        pending_statuses = {"uploaded", "indexing"}
+        pending_statuses = {"uploaded", "indexing", "summarizing"}
         pending_files = sum(1 for row in files if str(row.get("status", "")).strip().lower() in pending_statuses)
         ready_files = sum(1 for row in files if str(row.get("status", "")).strip().lower() == "ready")
         error_files = sum(1 for row in files if str(row.get("status", "")).strip().lower() == "error")
@@ -693,6 +949,87 @@ class RagService:
             "used_tokens": used_tokens,
         }
 
+    def _route_with_llm(self, chat_id: str, question: str, normalized_question: str) -> dict[str, object]:
+        history = self.db.list_messages(chat_id)
+        tail = history[-6:]
+        history_lines: list[str] = []
+        for row in tail:
+            role = str(row.get("role", "")).strip().lower()
+            content = str(row.get("content", "")).strip()
+            if role not in {"user", "assistant"} or not content:
+                continue
+            history_lines.append(f"{role.upper()}: {content}")
+        files = self.db.list_files(chat_id)
+        files_count = len(files)
+        ready_files = sum(1 for row in files if str(row.get("status", "")).strip().lower() == "ready")
+        pending_files = sum(
+            1 for row in files if str(row.get("status", "")).strip().lower() in {"uploaded", "indexing", "summarizing"}
+        )
+        error_files = sum(1 for row in files if str(row.get("status", "")).strip().lower() == "error")
+        recent_user = ""
+        for row in reversed(history):
+            if str(row.get("role", "")).strip().lower() == "user":
+                recent_user = str(row.get("content", "")).strip()
+                if recent_user:
+                    break
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Ты классификатор маршрута ответа для RAG-чата. Верни только JSON:\n"
+                    '{"mode":"rag|direct|followup_rag|followup_direct","needs_previous_message":true|false,'
+                    '"rewritten_question":"...","confidence":"high|medium|low","reason":"..."}\n'
+                    "Правила:\n"
+                    "1) Если в чате есть готовые файлы и вопрос НЕ чистый small-talk — выбирай rag.\n"
+                    "2) direct выбирай только для small-talk или явной просьбы отвечать без документов.\n"
+                    "3) Для коротких follow-up фраз учитывай HISTORY и ставь followup_rag.\n"
+                    "4) Никакого текста кроме JSON."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"FILES_COUNT={files_count}\n"
+                    f"READY_FILES={ready_files}\n"
+                    f"PENDING_FILES={pending_files}\n"
+                    f"ERROR_FILES={error_files}\n"
+                    f"QUESTION={question}\n"
+                    f"NORMALIZED={normalized_question}\n"
+                    f"LAST_USER_MESSAGE={recent_user}\n"
+                    f"HISTORY:\n{chr(10).join(history_lines)}"
+                ),
+            },
+        ]
+        try:
+            raw = self._collect_generation(messages, think=False)
+            parsed = _extract_json_object(raw)
+        except Exception as exc:  # noqa: BLE001
+            log(f"LLM router fallback: {exc}")
+            parsed = {}
+        mode = str(parsed.get("mode", "")).strip().lower()
+        if mode not in {"rag", "direct", "followup_rag", "followup_direct"}:
+            mode = "followup_rag" if _is_followup_request(normalized_question) else "rag"
+        rewrite = str(parsed.get("rewritten_question", "")).strip()
+        if not rewrite:
+            rewrite = normalized_question
+        needs_previous = bool(parsed.get("needs_previous_message", mode.startswith("followup")))
+        confidence = str(parsed.get("confidence", "medium")).strip().lower()
+        if confidence not in {"high", "medium", "low"}:
+            confidence = "medium"
+        reason = str(parsed.get("reason", "llm_router")).strip() or "llm_router"
+        return {
+            "mode": mode,
+            "needs_previous_message": needs_previous,
+            "rewritten_question": rewrite,
+            "confidence": confidence,
+            "reason": reason,
+            "router_used": bool(parsed),
+            "files_count": files_count,
+            "ready_files": ready_files,
+            "pending_files": pending_files,
+            "error_files": error_files,
+        }
+
     def _retrieve(
         self,
         chat_id: str,
@@ -700,9 +1037,16 @@ class RagService:
         normalized_question: str,
         retrieval_mode: str,
         final_k: int,
+        mentioned_file_ids: set[str] | None = None,
     ) -> dict[str, object]:
         recall_k = max(20, final_k * 4)
         all_chunks = self.vector_store.list_for_chat(chat_id)
+        if mentioned_file_ids:
+            all_chunks = [
+                row
+                for row in all_chunks
+                if str(row.get("file_id", "")).strip() in mentioned_file_ids
+            ]
         query_vector = self.embedder.embed(normalized_question, keep_alive=settings.embed_keep_alive_query)
         route_meta = self._resolve_route(
             user_question=user_question,
@@ -718,17 +1062,41 @@ class RagService:
         selected_k = int(route_meta["selected_top_k"])
         selected_recall_k = int(route_meta["selected_recall_k"])
         vector_weight, bm25_weight = _resolve_mode_weights(selected_mode, normalized_question, len(all_chunks))
-        search_query = normalized_question
-        if intent == "report":
-            acronyms = _extract_document_acronyms(all_chunks, limit=8)
-            extra = " ".join(acronyms)
-            search_query = f"{normalized_question} задания алгоритмы результаты вывод {extra}".strip()
-
-        if search_query != normalized_question:
+        queries = _build_multi_queries(
+            question=normalized_question,
+            intent=intent,
+            all_chunks=all_chunks,
+            followup_query=normalized_question,
+        )
+        per_query_rows: list[dict[str, object]] = []
+        merged_pool: list[dict[str, object]] = []
+        vector_hits: list[dict[str, object]] = []
+        bm25_hits: list[dict[str, object]] = []
+        search_query = queries[0] if queries else normalized_question
+        for idx, search_query in enumerate(queries):
             query_vector = self.embedder.embed(search_query, keep_alive=settings.embed_keep_alive_query)
-        vector_hits = self.vector_store.search(chat_id, query_vector, top_k=selected_recall_k)
-        bm25_hits = _bm25_search(search_query, all_chunks, top_n=selected_recall_k) if selected_mode != "embeddings" else []
-        merged = self._merge_hits(vector_hits, bm25_hits, selected_recall_k, vector_weight, bm25_weight)
+            local_vector_hits = self.vector_store.search(chat_id, query_vector, top_k=selected_recall_k)
+            local_bm25_hits = _bm25_search(search_query, all_chunks, top_n=selected_recall_k) if selected_mode != "embeddings" else []
+            local_merged = self._merge_hits(
+                local_vector_hits,
+                local_bm25_hits,
+                selected_recall_k,
+                vector_weight,
+                bm25_weight,
+            )
+            if idx == 0:
+                vector_hits = local_vector_hits
+                bm25_hits = local_bm25_hits
+            merged_pool.extend(local_merged)
+            per_query_rows.append(
+                {
+                    "query": search_query,
+                    "vector_candidates": _trace_rows(local_vector_hits, limit=10),
+                    "bm25_candidates": _trace_rows(local_bm25_hits, limit=10),
+                    "merged": _trace_rows(local_merged, limit=10),
+                }
+            )
+        merged = _merge_multi_query_rows(merged_pool, selected_recall_k)
 
         rerank_allowed = selected_mode == "hybrid_plus" and settings.reranker_enabled
         min_rerank = settings.rerank_min_candidates
@@ -785,6 +1153,8 @@ class RagService:
                 candidate_pool = filtered_pool
             final_hits = candidate_pool[:selected_k]
 
+        final_hits = _dedupe_by_source_uid(final_hits, selected_k, candidate_pool)
+
         rerank_enabled = rerank_allowed and len(merged) >= min_rerank and self.reranker is not None
         if not rerank_allowed:
             rerank_reason = "mode_disabled"
@@ -800,15 +1170,8 @@ class RagService:
             "normalized_query": normalized_question,
             "search_query": search_query,
             "rewrites": [],
-            "queries": [normalized_question] if search_query == normalized_question else [normalized_question, search_query],
-            "per_query": [
-                {
-                    "query": normalized_question,
-                    "vector_candidates": _trace_rows(vector_hits, limit=10),
-                    "bm25_candidates": _trace_rows(bm25_hits, limit=10),
-                    "merged": _trace_rows(merged, limit=10),
-                }
-            ],
+            "queries": queries,
+            "per_query": per_query_rows,
             "total_chunks_in_chat": len(all_chunks),
             "mode_meta": {
                 "vector_weight": vector_weight,
@@ -816,6 +1179,8 @@ class RagService:
                 "min_rerank_candidates": min_rerank,
                 "top_k": selected_k,
                 "recall_k": selected_recall_k,
+                "mentioned_file_filter_enabled": bool(mentioned_file_ids),
+                "mentioned_file_ids": sorted(list(mentioned_file_ids or set())),
             },
             "route_meta": route_meta,
             "vector_candidates": _trace_rows(vector_hits, limit=10),
@@ -851,6 +1216,7 @@ class RagService:
                     "file_id": hit.get("file_id"),
                     "file_name": hit.get("file_name"),
                     "chunk_index": hit.get("chunk_index"),
+                    "source_uid": hit.get("source_uid"),
                     "text": hit["text"],
                     "vector_score": 0.0,
                     "bm25_score": 0.0,
@@ -868,6 +1234,7 @@ class RagService:
                     "file_id": hit.get("file_id"),
                     "file_name": hit.get("file_name"),
                     "chunk_index": hit.get("chunk_index"),
+                    "source_uid": hit.get("source_uid"),
                     "text": hit["text"],
                     "vector_score": 0.0,
                     "bm25_score": 0.0,
@@ -876,6 +1243,7 @@ class RagService:
             row["file_id"] = row.get("file_id") or hit.get("file_id")
             row["file_name"] = row.get("file_name") or hit.get("file_name")
             row["chunk_index"] = row.get("chunk_index") if row.get("chunk_index") is not None else hit.get("chunk_index")
+            row["source_uid"] = row.get("source_uid") or hit.get("source_uid")
             row["bm25_score"] = _normalize_bm25(float(hit["score"]))
 
         merged = list(rows.values())
@@ -1024,7 +1392,8 @@ def _with_source_labels(hits: list[dict[str, object]]) -> list[dict[str, object]
     labeled: list[dict[str, object]] = []
     for index, hit in enumerate(hits, start=1):
         row = dict(hit)
-        row["source_label"] = f"SOURCE {index}"
+        file_name = str(row.get("file_name") or "").strip()
+        row["source_label"] = file_name or f"Файл {index}"
         labeled.append(row)
     return labeled
 
@@ -1037,17 +1406,17 @@ def _build_context_blocks(hits: list[dict[str, object]], intent: str = "qa") -> 
         label = str(hit.get("source_label", "SOURCE"))
         text = str(hit.get("text", "")).strip()
         source_ref = _source_reference(hit)
-        meta_line = f"Источник: {source_ref}\n" if source_ref else ""
-        blocks.append(f"[{label}]\n{meta_line}{text}")
+        meta_line = f"Раздел: {source_ref}\n" if source_ref else ""
+        blocks.append(f"[Файл: {label}]\n{meta_line}{text}")
     return "\n\n".join(blocks)
 
 
 def _source_reference(hit: dict[str, object]) -> str:
-    file_name = str(hit.get("file_name") or "").strip()
+    source_uid = str(hit.get("source_uid") or "").strip()
     chunk_index_raw = hit.get("chunk_index")
     parts: list[str] = []
-    if file_name:
-        parts.append(file_name)
+    if source_uid and ":" in source_uid:
+        parts.append(source_uid.split(":", 1)[1])
     try:
         chunk_number = int(chunk_index_raw) + 1
     except (TypeError, ValueError):
@@ -1742,6 +2111,7 @@ def _trace_rows(rows: list[dict[str, object]], limit: int = 30) -> list[dict[str
                 "chunk_id": row.get("chunk_id"),
                 "file_name": row.get("file_name"),
                 "chunk_index": row.get("chunk_index"),
+                "source_uid": row.get("source_uid"),
                 "score": row.get("score"),
                 "vector_score": row.get("vector_score"),
                 "bm25_score": row.get("bm25_score"),
@@ -1848,3 +2218,270 @@ def _effective_min_hits(trace: dict[str, object]) -> int:
     if total_chunks > 0:
         effective = min(effective, total_chunks)
     return max(1, effective)
+
+
+def _section_id(text: str, chunk_index: int) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    heading = ""
+    for line in lines[:4]:
+        if len(line) <= 96 and (line.endswith(":") or re.match(r"^\d+(\.\d+)*[.)]\s+", line)):
+            heading = re.sub(r"\s+", "_", line.lower())[:48]
+            break
+    return heading or f"group_{chunk_index // 3}"
+
+
+def _extract_json_object(raw: str) -> dict[str, object]:
+    payload = str(raw or "").strip()
+    if not payload:
+        return {}
+    try:
+        parsed = json.loads(payload)
+        return parsed if isinstance(parsed, dict) else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        pass
+    match = re.search(r"\{.*\}", payload, flags=re.S)
+    if not match:
+        return {}
+    try:
+        parsed = json.loads(match.group(0))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _fallback_summary_from_text(text: str) -> str:
+    sentences = _split_sentences(text)
+    picked = [s.strip() for s in sentences if len(s.strip()) >= 30][:5]
+    if picked:
+        return " ".join(picked)
+    return _truncate_to_token_budget(text, 160)
+
+
+def _fallback_key_points_from_text(text: str, limit: int) -> list[str]:
+    sentences = _split_sentences(text)
+    points: list[str] = []
+    for sentence in sentences:
+        clean = sentence.strip()
+        if len(clean) < 20:
+            continue
+        points.append(clean)
+        if len(points) >= limit:
+            break
+    return points
+
+
+def _build_multi_queries(
+    question: str,
+    intent: str,
+    all_chunks: list[dict[str, object]],
+    followup_query: str,
+) -> list[str]:
+    normalized = _normalize_query_text(question)
+    tokens = sorted(_content_tokens(normalized))
+    queries = [normalized]
+    if tokens:
+        queries.append(" ".join(tokens[:8]))
+    expansions: dict[str, tuple[str, ...]] = {
+        "compare": ("сравнение", "различия", "отличия"),
+        "report": ("итоги", "вывод", "основная идея"),
+        "extract": ("список", "пункты", "требования"),
+        "qa": ("факт", "ответ"),
+    }
+    extra = " ".join(expansions.get(intent, ()))
+    if extra:
+        queries.append(f"{normalized} {extra}".strip())
+    if followup_query and followup_query != normalized:
+        queries.append(followup_query)
+    acronyms = _extract_document_acronyms(all_chunks, limit=4)
+    if acronyms:
+        queries.append(f"{normalized} {' '.join(acronyms)}".strip())
+    unique: list[str] = []
+    for query in queries:
+        clean = _normalize_query_text(query)
+        if clean and clean not in unique:
+            unique.append(clean)
+    return unique[:5] if unique else [normalized]
+
+
+def _merge_multi_query_rows(rows: list[dict[str, object]], recall_k: int) -> list[dict[str, object]]:
+    if not rows:
+        return []
+    grouped: dict[str, dict[str, object]] = {}
+    counts: Counter[str] = Counter()
+    for row in rows:
+        chunk_id = str(row.get("chunk_id", ""))
+        if not chunk_id:
+            continue
+        counts[chunk_id] += 1
+        current = grouped.get(chunk_id)
+        if current is None or float(row.get("hybrid_score", 0.0)) > float(current.get("hybrid_score", 0.0)):
+            grouped[chunk_id] = dict(row)
+    merged = list(grouped.values())
+    for row in merged:
+        chunk_id = str(row.get("chunk_id", ""))
+        bonus = min(0.18, 0.04 * max(0, counts.get(chunk_id, 1) - 1))
+        row["hybrid_score"] = float(row.get("hybrid_score", 0.0)) + bonus
+    merged.sort(
+        key=lambda item: (
+            -float(item.get("hybrid_score", 0.0)),
+            -float(item.get("vector_score", 0.0)),
+            -float(item.get("bm25_score", 0.0)),
+            str(item.get("chunk_id", "")),
+        )
+    )
+    return merged[:recall_k]
+
+
+def _dedupe_by_source_uid(
+    final_hits: list[dict[str, object]],
+    limit: int,
+    candidate_pool: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    if limit <= 0:
+        return []
+    selected: list[dict[str, object]] = []
+    used: set[str] = set()
+    for row in final_hits:
+        source_uid = str(row.get("source_uid", "")).strip()
+        dedupe_key = source_uid or str(row.get("chunk_id", ""))
+        if dedupe_key in used:
+            continue
+        selected.append(row)
+        used.add(dedupe_key)
+        if len(selected) >= limit:
+            return selected
+    for row in candidate_pool:
+        source_uid = str(row.get("source_uid", "")).strip()
+        dedupe_key = source_uid or str(row.get("chunk_id", ""))
+        if dedupe_key in used:
+            continue
+        selected.append(row)
+        used.add(dedupe_key)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def _is_conversational_query(question: str) -> bool:
+    low = _normalize_query_text(question).lower()
+    patterns = (
+        r"\b(привет|здравствуй|как дела|спасибо|пока)\b",
+        r"\b(hello|hi|thanks|thank you|bye)\b",
+    )
+    return any(re.search(pattern, low) for pattern in patterns)
+
+
+def _is_document_scoped_query(question: str) -> bool:
+    low = _normalize_query_text(question).lower()
+    patterns = (
+        r"@",
+        r"\b(по файлу|по документу|в документе|из документа|по тексту)\b",
+        r"\b(расскажи о файле|что в файле|что в этом файле|содержание файла|summary|саммари|краткое содержание)\b",
+        r"\bчто\b.*\bфайл\w*\b",
+        r"\b(file|document|from the document|from file)\b",
+    )
+    return any(re.search(pattern, low) for pattern in patterns)
+
+
+def _is_summary_request(question: str) -> bool:
+    low = _normalize_query_text(question).lower()
+    patterns = (
+        r"\b(что в файле|что в этом файле|о чем файл|содержание файла|кратко|краткое содержание)\b",
+        r"\b(summary|summarize|overview)\b",
+    )
+    return any(re.search(pattern, low) for pattern in patterns)
+
+
+def _prefers_direct_without_docs(question: str) -> bool:
+    low = _normalize_query_text(question).lower()
+    patterns = (
+        r"\b(без документов|без документа|не по файлу|не по документу)\b",
+        r"\b(ответь общими знаниями|общими знаниями|без rag|no rag)\b",
+        r"\b(ignore files|without documents|not from file)\b",
+    )
+    return any(re.search(pattern, low) for pattern in patterns)
+
+
+def _resolve_mentioned_files(question: str, files_rows: list[dict[str, object]]) -> tuple[list[str], list[str], str]:
+    raw = str(question or "")
+    if not raw.strip() or not files_rows:
+        return ([], [], raw.strip())
+
+    matched_ids: list[str] = []
+    matched_names: list[str] = []
+    cleaned = raw
+    lowered = raw.lower()
+
+    for row in files_rows:
+        file_id = str(row.get("id", "")).strip()
+        file_name = str(row.get("name", "")).strip()
+        if not file_id or not file_name:
+            continue
+        stem = Path(file_name).stem.strip()
+        variants = [file_name, stem]
+        hit = False
+        for variant in variants:
+            if not variant:
+                continue
+            marker = f"@{variant.lower()}"
+            if marker in lowered:
+                hit = True
+                cleaned = re.sub(re.escape(f"@{variant}"), " ", cleaned, flags=re.I)
+        if not hit:
+            continue
+        if file_id not in matched_ids:
+            matched_ids.append(file_id)
+            matched_names.append(file_name)
+
+    # Token-style mentions: @shortname
+    tokens = re.findall(r"@([^\s,;:!?()\[\]{}]+)", raw)
+    if tokens:
+        key_to_file: dict[str, tuple[str, str]] = {}
+        for row in files_rows:
+            file_id = str(row.get("id", "")).strip()
+            file_name = str(row.get("name", "")).strip()
+            if not file_id or not file_name:
+                continue
+            keys = {_mention_key(file_name), _mention_key(Path(file_name).stem)}
+            for key in keys:
+                if key:
+                    key_to_file[key] = (file_id, file_name)
+        for token in tokens:
+            key = _mention_key(token)
+            if not key:
+                continue
+            found: tuple[str, str] | None = key_to_file.get(key)
+            if found is None:
+                for known_key, payload in key_to_file.items():
+                    if known_key.startswith(key) or key.startswith(known_key):
+                        found = payload
+                        break
+            if found is None:
+                continue
+            file_id, file_name = found
+            if file_id not in matched_ids:
+                matched_ids.append(file_id)
+                matched_names.append(file_name)
+            cleaned = re.sub(rf"@{re.escape(token)}\b", " ", cleaned, flags=re.I)
+
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return (matched_ids, matched_names, cleaned)
+
+
+def _mention_key(value: str) -> str:
+    low = str(value or "").lower()
+    # Keep latin/cyrillic letters and numbers; remove separators.
+    return re.sub(r"[^0-9a-zа-яё]+", "", low, flags=re.I)
+
+
+def _confidence_level(off_topic_meta: dict[str, float | int | bool], hits: list[dict[str, object]]) -> str:
+    if not hits:
+        return "low"
+    if bool(off_topic_meta.get("triggered", False)):
+        return "low"
+    score = float(_best_retrieval_score(hits))
+    if score >= 0.6:
+        return "high"
+    if score >= 0.35:
+        return "medium"
+    return "low"

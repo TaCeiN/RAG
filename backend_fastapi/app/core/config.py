@@ -63,7 +63,7 @@ class Settings:
     generator_keep_alive: int = 120
     # Включать ли отдельную модель реранкера.
     # False = быстрее/легче по памяти, True = потенциально точнее ранжирование.
-    reranker_enabled: bool = True
+    reranker_enabled: bool = False
     # Имя модели реранкера в Ollama.
     reranker_model: str = "ExpedientFalcon/qwen3-reranker:0.6b-q4_k_m"
     # Время удержания реранкер-модели в памяти после запроса (сек).

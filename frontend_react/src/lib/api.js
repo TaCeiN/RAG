@@ -36,11 +36,28 @@ export async function uploadFiles(chatId, files) {
   return response.json();
 }
 
-export async function streamMessage(chatId, payload, onEvent) {
+export async function updateChatTitle(chatId, title) {
+  const response = await fetch(`${API_BASE}/api/chats/${chatId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title }),
+  });
+  return response.json();
+}
+
+export async function cancelFileProcessing(chatId, fileId) {
+  const response = await fetch(`${API_BASE}/api/chats/${chatId}/files/${fileId}/cancel`, {
+    method: "POST",
+  });
+  return response.json();
+}
+
+export async function streamMessage(chatId, payload, onEvent, options = {}) {
   const response = await fetch(`${API_BASE}/api/chats/${chatId}/messages`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
+    signal: options.signal,
   });
 
   if (!response.ok || !response.body) {

@@ -61,7 +61,7 @@ cd backend_fastapi
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-python -m app.main
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8010
 ```
 
 Backend по умолчанию доступен на:
